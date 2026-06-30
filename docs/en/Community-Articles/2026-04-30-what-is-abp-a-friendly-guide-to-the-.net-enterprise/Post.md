@@ -1,4 +1,5 @@
 ![Generated illustration](inline-1.png)
+![Generated illustration](./inline-1.png)
 
 ## Introduction: Why Developers Ask "What Is ABP?"
 
@@ -27,7 +28,6 @@ Some of its core premises:
 
 
 
-![Generated illustration](./inline-3.png)
 ![Generated illustration](inline-3.png)
 
 ## Components of the ABP Ecosystem
