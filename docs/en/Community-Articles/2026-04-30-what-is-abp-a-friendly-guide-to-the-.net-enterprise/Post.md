@@ -1,5 +1,5 @@
-![Generated illustration](inline-1.png)
-![Generated illustration](./inline-1.png)
+![Generated illustration](in line-1.png)
+![Generated illustration](./in line-1.png)
 
 ## Introduction: Why Developers Ask "What Is ABP?"
 
