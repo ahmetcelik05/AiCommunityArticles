@@ -1,5 +1,3 @@
-# .NET 11 in Practice: FullJoin, Async Validation, Cache Metrics, Tracing Rules
-
 Every .NET release ships a long list of changes. Most of them matter to library authors or to people chasing the last few percent of throughput. This article is about four changes in .NET 11 that show up in ordinary application code: a LINQ operator you have probably hand-rolled more than once, validation rules that can finally `await`, cache metrics you no longer have to write yourself, and a way to turn distributed tracing on and off from configuration.
 
 Each feature gets the same treatment: the problem it solves, the API, a runnable example, the output you should expect, and the caveats we hit while testing. Everything was run on .NET 11 RC1, and the complete sample application is on GitHub: [github.com/ahmetcelik05/dotnet11-features-demo](https://github.com/ahmetcelik05/dotnet11-features-demo).
@@ -19,35 +17,9 @@ If you only have a minute, this is the whole article in one table:
 
 The sample is a small minimal API called `OrdersDemo`. It has no UI; you drive it with `curl` and watch the console. Each endpoint exists to demonstrate one feature, and the features also interact: placing an order runs async validation and then produces a traced activity.
 
-| Endpoint / component | Feature |
-|---|---|
-| `POST /orders` | Async DataAnnotations validation |
-| `GET /products/{sku}` | `MemoryCache` with built-in OpenTelemetry metrics |
-| `GET /reconciliation` | LINQ `FullJoin` |
-| `OrderService` + `Tracing` section in `appsettings.json` | Declarative `Activity` tracing rules |
-
 ![Sample application architecture](sample-app-architecture.png)
 
-The code is organised by feature (`Features/Orders`, `Features/Products`, `Features/Reconciliation`) with the tracing and OpenTelemetry wiring under `Infrastructure`. Every feature registers itself through an `Add...` extension and maps its routes through a `Map...Endpoints` extension, so `Program.cs` is only a composition root:
-
-```csharp
-var builder = WebApplication.CreateBuilder(args);
-
-builder.Services
-    .AddOrders()                            // async DataAnnotations validation + traced order placement
-    .AddProducts()                          // MemoryCache with built-in OpenTelemetry metrics
-    .AddReconciliation()                    // LINQ FullJoin
-    .AddDemoTracing(builder.Configuration)  // declarative Activity tracing rules
-    .AddDemoOpenTelemetry();                // console exporters for metrics and traces
-
-var app = builder.Build();
-
-app.MapOrdersEndpoints();
-app.MapProductsEndpoints();
-app.MapReconciliationEndpoints();
-
-app.Run();
-```
+The code is organised by feature (`Features/Orders`, `Features/Products`, `Features/Reconciliation`) with the tracing and OpenTelemetry wiring under `Infrastructure`. Every feature registers itself through an `Add...` extension and maps its routes through a `Map...Endpoints` extension, so `Program.cs` is only a composition root.
 
 ## 1. LINQ `FullJoin` and selector-less `Join`/`GroupJoin`
 
@@ -303,8 +275,6 @@ This is what RC1 publishes, captured with a `MeterListener` in the test suite:
 | `dotnet.cache.entries` | ObservableUpDownCounter | `{entry}` | |
 | `dotnet.cache.estimated_size` | ObservableGauge | `By` | |
 
-All four instruments are observable, so the cache's hot path only increments the counters it already maintained for `GetCurrentStatistics()`; the values are read when a collector asks.
-
 ### Example: a read-through product catalog
 
 In most applications the opt-in is a one-liner: `services.AddMemoryCache(options => options.TrackStatistics = true)`. The sample registers `AddMemoryCache()` and then configures it through an `IConfigureOptions<MemoryCacheOptions>` so that the demo-specific settings live next to the feature:
@@ -366,7 +336,7 @@ A detail that cost us a few minutes: with the default `CompactionPercentage` of 
 
 - **The tag name is changing.** RC1 emits `dotnet.cache.request.type` and labels `estimated_size` with the unit `By` (bytes). The `release/11.0` branch already renames the tag to `dotnet.cache.request.result` and changes the unit to `1`, because `SizeLimit` is an application-defined number, not bytes. Expect the rename in a later RC or in GA, and re-check any dashboard or alert that references the tag.
 - **`TrackStatistics` is not free.** It adds interlocked increments on every hit and miss. That is cheap, but measure it on a hot cache before enabling it everywhere.
-- **`MeterListener` users must poll.** Observable instruments only produce values on `RecordObservableInstruments()`. The same release moved the HTTP `open_connections` and `active_requests` metrics to observable instruments, so if you read metrics manually, this applies to more than the cache.
+- **All four instruments are observable.** The hot path only increments the counters it already kept for `GetCurrentStatistics()`; values are read when a collector asks. If you read metrics with `MeterListener`, call `RecordObservableInstruments()`. The same release moved the HTTP `open_connections` and `active_requests` metrics to observable instruments, so this applies to more than the cache.
 
 Metrics tell you how often the cache is hit. They do not tell you what a single slow order did along the way. For that you need traces, and the last feature is about deciding which traces you actually want, without a redeploy.
 
@@ -412,11 +382,11 @@ The configuration shape mirrors logging. This is the sample's `appsettings.json`
 }
 ```
 
-Under `Tracing`, `EnabledTracing` applies to all listeners; `EnabledGlobalTracing` and `EnabledLocalTracing` restrict a rule to sources created with `new ActivitySource(...)` or through `ActivitySourceFactory` respectively; any other key is treated as a listener name with its own nested block. Inside a source, `Default` sets the source-level rule and every other key is an operation name. A bare boolean (`"OrdersDemo.*": true`) is shorthand for `Default`; the `A_bare_boolean_in_configuration_is_shorthand_for_the_source_default` test checks that form.
+Under `Tracing`, `EnabledTracing` applies to all listeners; `EnabledGlobalTracing` and `EnabledLocalTracing` restrict a rule to sources created with `new ActivitySource(...)` or through `ActivitySourceFactory` respectively; any other key is treated as a listener name with its own nested block. Inside a source, `Default` sets the source-level rule and every other key is an operation name. A bare boolean (`"OrdersDemo.*": true`) is shorthand for `Default`.
 
 ### Example: a console listener driven by configuration
 
-The sample registers one named listener and binds the rules from configuration:
+The sample registers one named listener with `AddListener` and binds the rules from configuration with `AddConfiguration`, exactly as in the snippet above. The listener itself:
 
 ```csharp
 internal static class ConsoleActivityListener
@@ -437,40 +407,16 @@ internal static class ConsoleActivityListener
         Console.WriteLine($"[trace] {activity.Source.Name}/{activity.OperationName} {activity.Duration.TotalMilliseconds:F1} ms {tags}");
     }
 }
-
-public static IServiceCollection AddDemoTracing(this IServiceCollection services, IConfiguration configuration)
-{
-    services.AddTracing(tracing =>
-    {
-        tracing.AddListener(ConsoleActivityListener.Name, ConsoleActivityListener.Configure);
-        tracing.AddConfiguration(configuration.GetSection("Tracing"));
-    });
-
-    return services;
-}
 ```
 
-`OrderService` creates its source through the factory and emits two operations:
+`OrderService` creates its source through `ActivitySourceFactory` and starts two activities, `PlaceOrder` and `HealthCheck`:
 
 ```csharp
-internal sealed class OrderService(ActivitySourceFactory activitySourceFactory) : IOrderService
-{
-    private readonly ActivitySource _activitySource =
-        activitySourceFactory.Create(new ActivitySourceOptions("OrdersDemo.Orders"));
+private readonly ActivitySource _activitySource =
+    activitySourceFactory.Create(new ActivitySourceOptions("OrdersDemo.Orders"));
 
-    public async Task<string> PlaceOrderAsync(CreateOrderRequest request, CancellationToken cancellationToken)
-    {
-        using var activity = _activitySource.StartActivity("PlaceOrder");
-        activity?.SetTag("order.customer", request.CustomerEmail);
-        // ...
-    }
-
-    public async Task<bool> CheckHealthAsync(CancellationToken cancellationToken)
-    {
-        using var activity = _activitySource.StartActivity("HealthCheck"); // disabled by rule
-        // ...
-    }
-}
+using var activity = _activitySource.StartActivity("PlaceOrder");   // enabled by rule
+using var activity = _activitySource.StartActivity("HealthCheck");  // disabled by rule
 ```
 
 Place an order and call the health endpoint. Only the order shows up:
@@ -486,16 +432,16 @@ Now change `"HealthCheck": false` to `true` in `appsettings.json` while the app 
 [trace] OrdersDemo.Orders/HealthCheck 6.6 ms
 ```
 
-Set it back to `false` and the lines stop. No restart, no redeploy. The `Changing_configuration_at_runtime_refreshes_the_listener` test automates this with a temporary JSON file.
+Set it back to `false` and the lines stop. No restart, no redeploy.
 
 ### What we learned by running it
 
 The documentation for this feature is currently one paragraph and a five-line snippet, so most of the following comes from the source and from tests:
 
-- **Nothing is enabled by default.** `AddTracing()` without rules enables no source. The `Without_rules_nothing_is_traced` test confirms it.
+- **Nothing is enabled by default.** `AddTracing()` without rules enables no source.
 - **You must set `Sample`.** A listener without a sampling callback never records anything, and `StartActivity` returns `null` for its sources. The snippet in the release notes omits this, which is why our first attempt produced no output.
 - **Listeners activate when the host starts.** Rules are wired up during `IHost.StartAsync` (or when `ActivitySourceFactory` is first resolved). Building the service provider is not enough, which matters for tests and for tools that never start a host.
-- **Rules cover sources created with `new ActivitySource(...)` too.** Those are "global" scope; factory-created sources are "local". The `Rules_also_apply_to_sources_created_with_the_constructor` test enables `Legacy.*` and sees activities from a plain `new ActivitySource("Legacy.Billing")`.
+- **Rules cover sources created with `new ActivitySource(...)` too.** Those are "global" scope; factory-created sources are "local". A rule for `Legacy.*` picks up activities from a plain `new ActivitySource("Legacy.Billing")`.
 - **The most specific rule wins.** A rule with a listener name beats one without; a longer source pattern beats a shorter one; an operation name beats none. When two rules are equally specific, the one registered last wins, in both directions: disable-then-enable enables, enable-then-disable disables. Avoid relying on that and write rules that do not overlap.
 
 ### Rules and OpenTelemetry
@@ -510,22 +456,14 @@ That is the last of the four features. Everything above came out of one small ap
 
 ## Running the sample
 
-The repository pins the SDK in `global.json`. If you do not want RC1 to become your machine's default SDK, install it into a private folder:
-
-```powershell
-Invoke-WebRequest https://dot.net/v1/dotnet-install.ps1 -OutFile dotnet-install.ps1
-.\dotnet-install.ps1 -Version 11.0.100-rc.1.26425.128 -InstallDir D:\dotnet11 -NoPath
-D:\dotnet11\dotnet.exe --version   # 11.0.100-rc.1.26425.128
-```
-
-Then, from the repository root:
+The repository pins the SDK in `global.json` (`11.0.100-rc.1.26425.128`); the README shows how to install RC1 into a private folder without making it your machine's default SDK. Then, from the repository root:
 
 ```bash
 dotnet test
 dotnet run --project src/OrdersDemo   # listens on http://localhost:5028 (from launchSettings.json)
 ```
 
-The test project uses xUnit v3 on Microsoft.Testing.Platform (`dotnet new xunit --xunit-version v3`), and the run we used for this article looked like this:
+The test project uses xUnit v3 on Microsoft.Testing.Platform, and the run we used for this article looked like this:
 
 ```
 OrdersDemo.Tests.dll (net11.0|x64) passed [+28/x0/?0] (1s 461ms)
@@ -535,15 +473,13 @@ Test run summary: Passed!
   duration: 1s 896ms
 ```
 
-The 28 tests are the source of every claim in the "what we learned" lists above: join ordering and null keys, the validation pipeline order, the cache instruments, and the tracing rules including precedence and the runtime reload.
+Every bullet in the "what we learned" lists above is backed by a test with a matching name.
 
 ## Preview and RC caveats
 
-- **RC1 is go-live, not GA.** The runtime is supported in production, but names and units can still change, as the cache tag rename shows.
-- **`dotnet.cache.request.type` → `dotnet.cache.request.result`** and `estimated_size` unit `By` → `1` are already merged for release/11.0.
-- **Async validation in MVC controllers** is not covered by the RC1 documentation. Assume synchronous validation there.
-- **Tracing rules have minimal documentation.** The behaviours listed above were verified against RC1 source and tests, not against a specification. Re-verify against the GA docs.
-- **EF Core 11 `FullJoin` translation** is in preview along with the rest of EF Core 11.
+- **RC1 is go-live, not GA.** Names and units can still change; the cache tag rename (`request.type` → `request.result`, unit `By` → `1`) is already merged for release/11.0.
+- **Async validation in MVC controllers** is not covered by the RC1 documentation; assume synchronous validation there.
+- **Tracing rules have minimal documentation.** The behaviours above were verified against RC1 source and tests, not a specification; re-verify against the GA docs. EF Core 11's `FullJoin` translation is likewise still in preview.
 
 ## Adoption checklist
 
@@ -560,7 +496,7 @@ The 28 tests are the source of every claim in the "what we learned" lists above:
 
 ## Closing thoughts
 
-None of these four features will make the headline of the .NET 11 launch keynote, and that is exactly why they are worth knowing about: they are the changes you will use on a Tuesday afternoon, not the ones you will benchmark. Good luck with the upgrade. Pin your SDK, keep the tests from this article close, and treat every "it obviously works like this" moment with a little suspicion until GA, because RC1 has already taught us that a tag name can change between one branch and the next. If you run into a surprise we did not cover, the sample repository is the place to open an issue.
+None of these four features will make the headline of the .NET 11 launch keynote, and that is exactly why they are worth knowing about: they are the changes you will use on a Tuesday afternoon, not the ones you will benchmark. Good luck with the upgrade. Pin your SDK, keep the tests from this article close, and treat every "it obviously works like this" moment with a little suspicion until GA. If you run into a surprise we did not cover, the sample repository is the place to open an issue.
 
 ## References
 
