@@ -1,6 +1,6 @@
 Every .NET release ships a long list of changes. Most of them matter to library authors or to people chasing the last few percent of throughput. This article is about four changes in .NET 11 that show up in ordinary application code: a LINQ operator you have probably hand-rolled more than once, validation rules that can finally `await`, cache metrics you no longer have to write yourself, and a way to turn distributed tracing on and off from configuration.
 
-Each feature gets the same treatment: the problem it solves, the API, a runnable example, the output you should expect, and the caveats we hit while testing. Everything was run on .NET 11 RC1, and the complete sample application is on GitHub: [github.com/ahmetcelik05/dotnet11-features-demo](https://github.com/ahmetcelik05/dotnet11-features-demo).
+Each section covers the problem, the API, a runnable example with its output, and the caveats we hit while testing. Everything was run on .NET 11 RC1, and the complete sample application is on GitHub: [github.com/ahmetcelik05/dotnet11-features-demo](https://github.com/ahmetcelik05/dotnet11-features-demo).
 
 > **Where .NET 11 stands today.** .NET 11 RC1 shipped on September 8, 2026 with a go-live license. General availability is planned for November 10, 2026, and .NET 11 is a Standard Term Support (STS) release, supported until November 9, 2028. The APIs below are in RC1, but as you will see in the cache metrics section, details can still move before GA.
 
@@ -19,13 +19,13 @@ The sample is a small minimal API called `OrdersDemo`. It has no UI; you drive i
 
 ![Sample application architecture](sample-app-architecture.png)
 
-The code is organised by feature (`Features/Orders`, `Features/Products`, `Features/Reconciliation`) with the tracing and OpenTelemetry wiring under `Infrastructure`. Every feature registers itself through an `Add...` extension and maps its routes through a `Map...Endpoints` extension, so `Program.cs` is only a composition root.
+Each feature lives in its own folder under `Features` and registers itself through `Add...` and `Map...Endpoints` extensions, so `Program.cs` is only a composition root.
 
 ## 1. LINQ `FullJoin` and selector-less `Join`/`GroupJoin`
 
 ### The problem
 
-.NET 10 added `LeftJoin` and `RightJoin`. A full outer join was still missing, so if you needed "everything from both sides, matched where possible" you wrote a left join, a right join, and a `Concat` or `Union`, or a `GroupJoin`/`SelectMany`/`DefaultIfEmpty` combination in each direction. Most of us have a `FullOuterJoin` extension method somewhere in a `Utils` folder, copied from a Stack Overflow answer, with a subtle bug about duplicate keys that nobody has hit yet. It works, right up until a reconciliation report is wrong and you spend an afternoon finding out why.
+.NET 10 added `LeftJoin` and `RightJoin`. A full outer join was still missing, so if you needed "everything from both sides, matched where possible" you wrote a left join, a right join, and a `Concat` or `Union`, or a `GroupJoin`/`SelectMany`/`DefaultIfEmpty` combination in each direction. Most of us have a `FullOuterJoin` extension method somewhere in a `Utils` folder, copied from a Stack Overflow answer. It works, right up until a reconciliation report is wrong.
 
 A smaller annoyance: `Join` and `GroupJoin` always required a result selector. In most call sites that selector was `(a, b) => (a, b)`, typed for the hundredth time.
 
@@ -91,13 +91,13 @@ Calling `GET /reconciliation` with three warehouse rows (`LAPTOP-15`, `mouse-01`
 ]
 ```
 
-Note the second row. The warehouse spells the SKU `mouse-01` and the ERP spells it `MOUSE-01`; without the `StringComparer.OrdinalIgnoreCase` argument they would come back as two separate "missing" rows instead of one mismatch. Feeds from different systems disagree on casing more often than anyone would like, which is why the comparer parameter is worth having on every join in the family.
+Note the second row: `mouse-01` and `MOUSE-01` matched only because of the `StringComparer.OrdinalIgnoreCase` argument. Without it they would be two separate "missing" rows, which is exactly what happens in real life when two systems disagree on casing and nobody passes a comparer.
 
 ### What the tests told us about the semantics
 
 The documentation describes the join operators but not their ordering or null behaviour. We wrote tests against RC1 to pin down what you can observe today:
 
-- **Output order.** Rows follow the outer sequence; inner elements without a match are appended at the end. For `outer = [1, 2, 3]` and `inner = [3, 4, 2]`, `FullJoin` yields `(1, 0), (2, 2), (3, 3), (0, 4)`. The implementation builds a lookup from the inner sequence, so this is a natural consequence, but it is not a documented guarantee. Do not rely on it across versions.
+- **Output order.** Rows follow the outer sequence; inner elements without a match are appended at the end. For `outer = [1, 2, 3]` and `inner = [3, 4, 2]`, `FullJoin` yields `(1, 0), (2, 2), (3, 3), (0, 4)`. This is an implementation detail, not a documented guarantee.
 - **Null keys never match.** A `null` key on either side produces an unmatched row, which is consistent with SQL's `NULL = NULL` being false.
 - **Value types lose "no match".** In the example above, `(1, 0)` means "outer 1 had no partner", but `0` is also a perfectly valid inner value. When the element type is a struct, use nullable elements or the `resultSelector` overload where you can distinguish the two.
 - **`GroupJoin` does not return tuples.** The "What's new" page calls the new overloads "tuple-returning", and that is accurate for `Join`. The selector-less `GroupJoin` returns `IEnumerable<IGrouping<TOuter, TInner>>`: the outer element is the `Key`, and the group holds the matching inner elements.
@@ -118,7 +118,7 @@ That covers combining data that is already in memory. The next feature is about 
 
 ### The problem
 
-`ValidationAttribute.IsValid` is synchronous. Rules that need I/O, such as "is this e-mail registered", "does this VAT number exist in the tax registry", or "is there enough stock", either blocked a thread with `.GetAwaiter().GetResult()` or moved out of the validation layer entirely. Once they move, their error messages no longer flow through `ValidationResult` and `ValidationProblemDetails`, and every consumer of the model has to remember to call them. You know the result: a `[Required]` failure comes back as a tidy 400 with a field name, while "customer not found" surfaces as a 500 from somewhere inside the service layer, and the front-end team asks why the two look nothing alike.
+`ValidationAttribute.IsValid` is synchronous. Rules that need I/O, such as "is this e-mail registered", "does this VAT number exist in the tax registry", or "is there enough stock", either blocked a thread with `.GetAwaiter().GetResult()` or moved out of the validation layer entirely. Once they move, their error messages no longer flow through `ValidationResult` and `ValidationProblemDetails`, and every consumer of the model has to remember to call them. You know the result: `[Required]` failures arrive as a tidy 400 with a field name, "customer not found" arrives as a 500 from the service layer, and the front-end team asks why.
 
 ### The API
 
@@ -130,10 +130,7 @@ That covers combining data that is already in memory. The next feature is about 
 
 ![The async validation pipeline](async-validation-pipeline.png)
 
-Two design points matter before you write your first attribute:
-
-1. **The synchronous `IsValid(object?, ValidationContext)` is abstract on `AsyncValidationAttribute`.** You must implement it. The framework samples throw from it so that accidental synchronous validation fails loudly instead of silently skipping the rule. That is the approach we take below.
-2. **`IAsyncValidatableObject` inherits `IValidatableObject`.** Your model therefore implements both `Validate` and `ValidateAsync`, and the same decision applies to the synchronous one.
+One design point matters before you write your first rule: the synchronous members are still required. `IsValid(object?, ValidationContext)` is abstract on `AsyncValidationAttribute`, and `IAsyncValidatableObject` inherits `IValidatableObject.Validate`. The framework samples throw from both so that accidental synchronous validation fails loudly instead of silently skipping the rule, and that is the approach we take below.
 
 ### Example: an async attribute and an async object rule
 
@@ -240,9 +237,9 @@ From reading `Validator` and confirming with tests, the async path works like th
 
 1. `[Required]` is evaluated first for each property and short-circuits that property on failure.
 2. Synchronous attributes on a property run next. Async attributes run only if all synchronous ones pass, and they run concurrently.
-3. Type-level attributes follow, then `IAsyncValidatableObject.ValidateAsync` (or `IValidatableObject.Validate` for older models).
+3. Type-level attributes follow, then `IAsyncValidatableObject.ValidateAsync`.
 4. If you pass `null` for the results collection, validation stops at the first failure; with a collection it keeps going and collects everything.
-5. The cancellation token flows into every async rule. Our test cancels the token before validating and gets an `OperationCanceledException`.
+5. The cancellation token flows into every async rule.
 
 ### The migration trap
 
@@ -252,7 +249,7 @@ So what happens when an older code path calls the synchronous `Validator.TryVali
 System.InvalidOperationException: RegisteredCustomerAttribute only supports asynchronous validation. Use Validator.ValidateObjectAsync.
 ```
 
-That is the right failure mode, but it means adding an async attribute to a model is a breaking change for every caller that still validates synchronously. Before you decorate a shared model, find those callers. Minimal APIs and Blazor forms use the async path in .NET 11; the ASP.NET Core release notes do not list MVC controllers, and the public design notes for the feature defer MVC support to follow-up work, so treat MVC as a synchronous caller until the docs say otherwise.
+That is the right failure mode, but it makes adding an async attribute a breaking change for every caller that still validates synchronously, so find those callers before you decorate a shared model. Minimal APIs and Blazor forms use the async path in .NET 11; MVC controllers are not listed in the RC1 notes and the public design notes defer them to follow-up work, so treat MVC as a synchronous caller until the docs say otherwise.
 
 Validation decides whether a request gets in. The next two features are about seeing what the application does once it is in, starting with the cache that every request touches.
 
@@ -330,11 +327,11 @@ Metric Name: dotnet.cache.estimated_size, Description: Estimated size of the cac
 
 Four misses (one per SKU), four hits, and one eviction because the size limit is three. The hit ratio is `hit / (hit + miss)`, which you can compute in any backend that supports the tag.
 
-A detail that cost us a few minutes: with the default `CompactionPercentage` of 5 %, our three-entry cache never reported an eviction; the fourth entry was simply not added and the counter stayed at zero. The sample sets the percentage to 50 % so that over-capacity compaction visibly removes an entry. Real caches are large enough that the default is fine.
+A detail that cost us a few minutes: with the default `CompactionPercentage` of 5 %, a three-entry cache never evicts anything; it just refuses the fourth entry. The sample uses 50 % so the counter moves; real caches are large enough that the default is fine.
 
 ### Caveats
 
-- **The tag name is changing.** RC1 emits `dotnet.cache.request.type` and labels `estimated_size` with the unit `By` (bytes). The `release/11.0` branch already renames the tag to `dotnet.cache.request.result` and changes the unit to `1`, because `SizeLimit` is an application-defined number, not bytes. Expect the rename in a later RC or in GA, and re-check any dashboard or alert that references the tag.
+- **The tag name is changing.** RC1 emits `dotnet.cache.request.type` and unit `By`; the `release/11.0` branch already has `dotnet.cache.request.result` and unit `1`, because `SizeLimit` is an application-defined number, not bytes. Re-check any dashboard or alert that references the tag at GA.
 - **`TrackStatistics` is not free.** It adds interlocked increments on every hit and miss. That is cheap, but measure it on a hot cache before enabling it everywhere.
 - **All four instruments are observable.** The hot path only increments the counters it already kept for `GetCurrentStatistics()`; values are read when a collector asks. If you read metrics with `MeterListener`, call `RecordObservableInstruments()`. The same release moved the HTTP `open_connections` and `active_requests` metrics to observable instruments, so this applies to more than the cache.
 
@@ -344,7 +341,7 @@ Metrics tell you how often the cache is hit. They do not tell you what a single 
 
 ### The problem
 
-`ActivitySource.StartActivity` returns `null` unless some `ActivityListener` has said it is interested in that source. Deciding which sources are interesting has always happened in code: either an `ActivityListener` with a `ShouldListenTo` callback, or OpenTelemetry's `AddSource`. Changing the decision meant a redeploy. If you have ever shipped a hotfix whose entire diff was one more `AddSource("...")` line, or watched a noisy health-check span flood a trace backend because nobody could turn it off in production, you know the feeling. Logging solved the equivalent problem years ago with `Logging:LogLevel` in `appsettings.json`, and metrics got `MetricsBuilder.EnableMetrics` in .NET 8. Tracing had nothing.
+`ActivitySource.StartActivity` returns `null` unless some `ActivityListener` has said it is interested in that source. Deciding which sources are interesting has always happened in code: either an `ActivityListener` with a `ShouldListenTo` callback, or OpenTelemetry's `AddSource`. Changing the decision meant a redeploy. If you have ever watched a noisy health-check span flood a trace backend because nobody could turn it off in production, you know the feeling. Logging solved the equivalent problem years ago with `Logging:LogLevel` in `appsettings.json`, and metrics got `MetricsBuilder.EnableMetrics` in .NET 8. Tracing had nothing.
 
 ### The API
 
@@ -382,11 +379,11 @@ The configuration shape mirrors logging. This is the sample's `appsettings.json`
 }
 ```
 
-Under `Tracing`, `EnabledTracing` applies to all listeners; `EnabledGlobalTracing` and `EnabledLocalTracing` restrict a rule to sources created with `new ActivitySource(...)` or through `ActivitySourceFactory` respectively; any other key is treated as a listener name with its own nested block. Inside a source, `Default` sets the source-level rule and every other key is an operation name. A bare boolean (`"OrdersDemo.*": true`) is shorthand for `Default`.
+`EnabledTracing` applies to all listeners; `EnabledGlobalTracing` and `EnabledLocalTracing` target only sources created with `new ActivitySource(...)` or through `ActivitySourceFactory`, respectively; any other key under `Tracing` is a listener name with its own nested block. Inside a source, `Default` is the source-level rule, every other key is an operation name, and a bare boolean (`"OrdersDemo.*": true`) is shorthand for `Default`.
 
 ### Example: a console listener driven by configuration
 
-The sample registers one named listener with `AddListener` and binds the rules from configuration with `AddConfiguration`, exactly as in the snippet above. The listener itself:
+The sample registers one named listener with `AddListener` and binds the rules with `AddConfiguration`, as in the snippet above but without the code-based rules. The listener itself:
 
 ```csharp
 internal static class ConsoleActivityListener
@@ -415,7 +412,10 @@ internal static class ConsoleActivityListener
 private readonly ActivitySource _activitySource =
     activitySourceFactory.Create(new ActivitySourceOptions("OrdersDemo.Orders"));
 
+// in PlaceOrderAsync
 using var activity = _activitySource.StartActivity("PlaceOrder");   // enabled by rule
+
+// in CheckHealthAsync
 using var activity = _activitySource.StartActivity("HealthCheck");  // disabled by rule
 ```
 
@@ -425,7 +425,7 @@ Place an order and call the health endpoint. Only the order shows up:
 [trace] OrdersDemo.Orders/PlaceOrder 10.2 ms order.customer=ada@example.com order.lines=1 order.id=ORD-6067
 ```
 
-Now change `"HealthCheck": false` to `true` in `appsettings.json` while the app is running. ASP.NET Core loads `appsettings.json` with `reloadOnChange`, the `TracingOptions` monitor fires, and the listener refreshes its source filters. The next two health calls print:
+Now change `"HealthCheck": false` to `true` in `appsettings.json` while the app is running. The configuration reloads, the listener refreshes its filters, and the next two health calls print:
 
 ```
 [trace] OrdersDemo.Orders/HealthCheck 16.0 ms
@@ -442,17 +442,17 @@ The documentation for this feature is currently one paragraph and a five-line sn
 - **You must set `Sample`.** A listener without a sampling callback never records anything, and `StartActivity` returns `null` for its sources. The snippet in the release notes omits this, which is why our first attempt produced no output.
 - **Listeners activate when the host starts.** Rules are wired up during `IHost.StartAsync` (or when `ActivitySourceFactory` is first resolved). Building the service provider is not enough, which matters for tests and for tools that never start a host.
 - **Rules cover sources created with `new ActivitySource(...)` too.** Those are "global" scope; factory-created sources are "local". A rule for `Legacy.*` picks up activities from a plain `new ActivitySource("Legacy.Billing")`.
-- **The most specific rule wins.** A rule with a listener name beats one without; a longer source pattern beats a shorter one; an operation name beats none. When two rules are equally specific, the one registered last wins, in both directions: disable-then-enable enables, enable-then-disable disables. Avoid relying on that and write rules that do not overlap.
+- **The most specific rule wins.** A listener name beats none, a longer source pattern beats a shorter one, an operation name beats none. Between equally specific rules the last one registered wins; avoid overlapping rules rather than relying on that.
 
 ### Rules and OpenTelemetry
 
 This is the question everyone will ask: does `AddTracing` replace OpenTelemetry's `AddSource`? No. OpenTelemetry registers its own `ActivityListener`, and the rules only govern listeners registered through `AddTracing`. We confirmed this with an OpenTelemetry `TracerProvider` and a rule that disables `HealthCheck`: OpenTelemetry still received `HealthCheck`, and the rule-driven listener did not.
 
-There is one interaction worth knowing about. ASP.NET Core's hosting layer creates a request activity even when nothing samples it (our `PlaceOrder` spans carried a `ParentSpanId` although no ASP.NET Core instrumentation was registered), and that parent is not marked as recorded. OpenTelemetry's default `ParentBased(AlwaysOn)` sampler follows the parent and therefore drops the child spans, unless another listener has already sampled them. In our first run the rule-driven listener's `AllDataAndRecorded` decision for `PlaceOrder` was what made OpenTelemetry export it, while `HealthCheck` looked as if the rule had suppressed it in OpenTelemetry too. Sampling decisions are combined across listeners, and the most permissive one wins. The sample uses `SetSampler(new AlwaysOnSampler())` in the OpenTelemetry pipeline to keep the two mechanisms independent; in production you would use ASP.NET Core instrumentation so that the parent is sampled properly.
+There is one interaction worth knowing about. ASP.NET Core's hosting layer creates a request activity even when no listener samples it, so that parent is unrecorded, and OpenTelemetry's default `ParentBased(AlwaysOn)` sampler follows the parent and drops the child spans. Sampling decisions are combined across listeners with the most permissive winning, so in our first run the rule-driven listener's `AllDataAndRecorded` decision is what got `PlaceOrder` exported, while `HealthCheck` looked as if the rule had suppressed it in OpenTelemetry too. The sample uses `SetSampler(new AlwaysOnSampler())` to keep the two mechanisms independent; in production, ASP.NET Core instrumentation samples the parent properly.
 
 So where does this API fit? Use it for listeners you own: a console or file listener for local debugging, an in-process collector, a diagnostic listener you want operators to toggle in a running service. Keep your OpenTelemetry pipeline as it is.
 
-That is the last of the four features. Everything above came out of one small application and one test suite, so here is how to run them yourself.
+That is the last of the four features. Here is how to run the application and the tests behind them yourself.
 
 ## Running the sample
 
@@ -473,7 +473,7 @@ Test run summary: Passed!
   duration: 1s 896ms
 ```
 
-Every bullet in the "what we learned" lists above is backed by a test with a matching name.
+Every observed behaviour listed in the feature sections above is backed by a test with a matching name.
 
 ## Preview and RC caveats
 
@@ -483,20 +483,20 @@ Every bullet in the "what we learned" lists above is backed by a test with a mat
 
 ## Adoption checklist
 
-1. Target `net11.0` and pin the SDK in `global.json`. Use `rollForward: latestFeature` so the GA SDK picks up without edits.
-2. Replace hand-written full outer joins with `FullJoin`. Add tests for null keys and, if your elements are value types, decide how to represent "no match".
-3. Convert `Join`/`GroupJoin` calls whose selector is `(a, b) => (a, b)` to the selector-less overloads. Remember that `GroupJoin` returns `IGrouping<TOuter, TInner>`.
-4. Move I/O-bound validation into `AsyncValidationAttribute` or `IAsyncValidatableObject`. Decide whether the synchronous `IsValid` throws or has a fallback, and document it.
-5. Find every caller that validates those models synchronously (`Validator.*`, MVC model binding, custom pipelines). Switch them to the async API or keep async attributes off shared models.
-6. Call `AddValidation()` in minimal API projects and pass `HttpContext.RequestAborted` through to your validators.
-7. Enable `TrackStatistics` and set `MemoryCacheOptions.Name` on caches you want to observe. Add the meter to your OpenTelemetry pipeline and build a hit-ratio panel. Re-check the tag name at GA.
-8. If you read metrics with `MeterListener`, call `RecordObservableInstruments()` on your collection interval.
-9. Move custom `ActivityListener` code to `AddTracing` with a named listener and a `Tracing` configuration section. Always set `Sample`. Leave your OpenTelemetry `AddSource` calls alone.
-10. Consider `ActivitySourceFactory` over static `ActivitySource` fields in new code so that sources participate in "local" scope rules.
+1. Target `net11.0`, pin the SDK in `global.json` with `rollForward: latestFeature`.
+2. Replace hand-written full outer joins with `FullJoin`; test null keys and decide how value types represent "no match".
+3. Convert `(a, b) => (a, b)` selectors to the selector-less `Join`/`GroupJoin` overloads; remember `GroupJoin` returns `IGrouping`.
+4. Move I/O-bound rules to `AsyncValidationAttribute` or `IAsyncValidatableObject`; decide whether the synchronous members throw or fall back.
+5. Find every synchronous caller of those models (`Validator.*`, MVC model binding, custom pipelines) and switch it, or keep async attributes off shared models.
+6. Call `AddValidation()` in minimal API projects and pass `HttpContext.RequestAborted` through.
+7. Enable `TrackStatistics`, set `MemoryCacheOptions.Name`, add the meter to OpenTelemetry, build a hit-ratio panel; re-check the tag name at GA.
+8. If you use `MeterListener`, call `RecordObservableInstruments()` on your collection interval.
+9. Move custom `ActivityListener` code to `AddTracing` with a named listener and a `Tracing` section; always set `Sample`; leave OpenTelemetry's `AddSource` alone.
+10. Prefer `ActivitySourceFactory` over static `ActivitySource` fields in new code.
 
 ## Closing thoughts
 
-None of these four features will make the headline of the .NET 11 launch keynote, and that is exactly why they are worth knowing about: they are the changes you will use on a Tuesday afternoon, not the ones you will benchmark. Good luck with the upgrade. Pin your SDK, keep the tests from this article close, and treat every "it obviously works like this" moment with a little suspicion until GA. If you run into a surprise we did not cover, the sample repository is the place to open an issue.
+None of these four features will headline the .NET 11 launch keynote, and that is exactly why they are worth knowing: they are the changes you will use on a Tuesday afternoon, not the ones you will benchmark. Good luck with the upgrade, keep the tests from this article close, and treat every "it obviously works like this" moment with a little suspicion until GA. If you hit a surprise we did not cover, the sample repository is the place to open an issue.
 
 ## References
 
