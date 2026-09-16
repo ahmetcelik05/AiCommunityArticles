@@ -1,12 +1,12 @@
 Every .NET release ships a long list of changes. Most of them matter to library authors or to people chasing the last few percent of throughput. This article is about four changes in .NET 11 that show up in ordinary application code: a LINQ operator you have probably hand-rolled more than once, validation rules that can finally `await`, cache metrics you no longer have to write yourself, and a way to turn distributed tracing on and off from configuration.
 
-Each section covers the problem, the API, a runnable example with its output, and the caveats we hit while testing. Everything was run on .NET 11 RC1, and the complete sample application is on GitHub: [github.com/ahmetcelik05/dotnet11-features-demo](https://github.com/ahmetcelik05/dotnet11-features-demo).
+Each section covers the problem, the API, a runnable example with its output, and the caveats I hit while testing. Everything was run on .NET 11 RC1, and the complete sample application is on GitHub: [github.com/ahmetcelik05/dotnet11-features-demo](https://github.com/ahmetcelik05/dotnet11-features-demo).
 
 > **Where .NET 11 stands today.** .NET 11 RC1 shipped on September 8, 2026 with a go-live license. General availability is planned for November 10, 2026, and .NET 11 is a Standard Term Support (STS) release, supported until November 9, 2028. The APIs below are in RC1, but as you will see in the cache metrics section, details can still move before GA.
 
-If you only have a minute, this is the whole article in one table:
+Short on time? The whole article in one table:
 
-| Feature | What is new in .NET 11 | The catch we found on RC1 |
+| Feature | What is new in .NET 11 | The catch I found on RC1 |
 |---|---|---|
 | LINQ joins | `FullJoin`, plus `Join`/`GroupJoin` overloads without a result selector | `GroupJoin` returns `IGrouping`, not a tuple; value-type `default` hides "no match" |
 | Async validation | `AsyncValidationAttribute`, `IAsyncValidatableObject`, `Validator.*Async` | Synchronous `Validator` calls on the same model throw |
@@ -52,7 +52,7 @@ IEnumerable<TResult> FullJoin<TOuter, TInner, TKey, TResult>(
 
 ### Example: reconciling two stock systems
 
-The sample compares stock levels reported by a warehouse and by an ERP system. A SKU can exist in either system or both, and when it exists in both the quantities may disagree. That is a full outer join whose three pair shapes map to four statuses, and pattern matching on the tuple expresses that directly:
+The reconciliation endpoint compares stock levels reported by a warehouse and by an ERP system. A SKU can exist in either system or both, and when it exists in both the quantities may disagree. Three pair shapes, four statuses, one full outer join, and pattern matching on the tuple expresses all of it directly:
 
 ```csharp
 internal sealed class ReconciliationService : IReconciliationService
@@ -93,14 +93,15 @@ Calling `GET /reconciliation` with three warehouse rows (`LAPTOP-15`, `mouse-01`
 
 Note the second row: `mouse-01` and `MOUSE-01` matched only because of the `StringComparer.OrdinalIgnoreCase` argument. Without it they would be two separate "missing" rows, which is exactly what happens in real life when two systems disagree on casing and nobody passes a comparer.
 
-### What the tests told us about the semantics
+### What the tests showed about the semantics
 
-The documentation describes the join operators but not their ordering or null behaviour. We wrote tests against RC1 to pin down what you can observe today:
+The documentation describes the join operators but not their ordering or null behaviour, so I wrote tests against RC1 to pin down what you can observe today.
 
-- **Output order.** Rows follow the outer sequence; inner elements without a match are appended at the end. For `outer = [1, 2, 3]` and `inner = [3, 4, 2]`, `FullJoin` yields `(1, 0), (2, 2), (3, 3), (0, 4)`. This is an implementation detail, not a documented guarantee.
-- **Null keys never match.** A `null` key on either side produces an unmatched row, which is consistent with SQL's `NULL = NULL` being false.
-- **Value types lose "no match".** In the example above, `(1, 0)` means "outer 1 had no partner", but `0` is also a perfectly valid inner value. When the element type is a struct, use nullable elements or the `resultSelector` overload where you can distinguish the two.
-- **`GroupJoin` does not return tuples.** The "What's new" page calls the new overloads "tuple-returning", and that is accurate for `Join`. The selector-less `GroupJoin` returns `IEnumerable<IGrouping<TOuter, TInner>>`: the outer element is the `Key`, and the group holds the matching inner elements.
+Output order follows the outer sequence, with unmatched inner elements appended at the end: for `outer = [1, 2, 3]` and `inner = [3, 4, 2]`, `FullJoin` yields `(1, 0), (2, 2), (3, 3), (0, 4)`. Treat that as an implementation detail, not a guarantee. Null keys never match each other; a `null` key on either side produces an unmatched row, the same way `NULL = NULL` is false in SQL.
+
+Look at that `(1, 0)` again. It means "outer 1 had no partner", but `0` is also a perfectly valid inner value, and nothing in the tuple tells you which. When the element type is a struct, use nullable elements or the `resultSelector` overload so you can tell the two apart.
+
+One more surprise: the selector-less `GroupJoin` does not return tuples. The "What's new" page calls the new overloads "tuple-returning", which is true for `Join`, but `GroupJoin` returns `IEnumerable<IGrouping<TOuter, TInner>>` with the outer element as the `Key` and the matching inner elements as the group.
 
 ```csharp
 var grouped = customers
@@ -110,7 +111,7 @@ var grouped = customers
 
 ### When to use it
 
-Use `FullJoin` whenever you need a reconciliation, a diff, or a "which side is missing what" report over two in-memory sequences. Keep the memory profile in mind: the inner sequence is fully materialised into a lookup, so put the smaller sequence on the inner side. If you are querying a database, EF Core 11 translates `Queryable.FullJoin` to `FULL JOIN` on SQL Server. EF Core 11 is still in preview at the time of writing, so check the provider you use before relying on it.
+Use `FullJoin` whenever you need a reconciliation, a diff, or a "who did not show up on the other list" report over two in-memory sequences. Keep the memory profile in mind: the inner sequence is fully materialised into a lookup, so put the smaller sequence on the inner side. Against a database, EF Core 11 translates `Queryable.FullJoin` to `FULL JOIN` on SQL Server. EF Core 11 is still in preview at the time of writing, so check the provider you use before relying on it.
 
 That covers combining data that is already in memory. The next feature is about the data on its way in: the order request that arrives at `POST /orders` and has to be checked against systems you can only reach asynchronously.
 
@@ -130,7 +131,7 @@ That covers combining data that is already in memory. The next feature is about 
 
 ![The async validation pipeline](async-validation-pipeline.png)
 
-One design point matters before you write your first rule: the synchronous members are still required. `IsValid(object?, ValidationContext)` is abstract on `AsyncValidationAttribute`, and `IAsyncValidatableObject` inherits `IValidatableObject.Validate`. The framework samples throw from both so that accidental synchronous validation fails loudly instead of silently skipping the rule, and that is the approach we take below.
+One design point matters before you write your first rule: the synchronous members are still required. `IsValid(object?, ValidationContext)` is abstract on `AsyncValidationAttribute`, and `IAsyncValidatableObject` inherits `IValidatableObject.Validate`. The framework samples throw from both so that accidental synchronous validation fails loudly instead of silently skipping the rule, and that is the approach I take below.
 
 ### Example: an async attribute and an async object rule
 
@@ -238,7 +239,7 @@ From reading `Validator` and confirming with tests, the async path works like th
 1. `[Required]` is evaluated first for each property and short-circuits that property on failure.
 2. Synchronous attributes on a property run next. Async attributes run only if all synchronous ones pass, and they run concurrently.
 3. Type-level attributes follow, then `IAsyncValidatableObject.ValidateAsync`.
-4. If you pass `null` for the results collection, validation stops at the first failure; with a collection it keeps going and collects everything.
+4. Pass `null` for the results collection and validation stops at the first failure; pass a collection and it keeps going and collects everything.
 5. The cancellation token flows into every async rule.
 
 ### The migration trap
@@ -249,7 +250,7 @@ So what happens when an older code path calls the synchronous `Validator.TryVali
 System.InvalidOperationException: RegisteredCustomerAttribute only supports asynchronous validation. Use Validator.ValidateObjectAsync.
 ```
 
-That is the right failure mode, but it makes adding an async attribute a breaking change for every caller that still validates synchronously, so find those callers before you decorate a shared model. Minimal APIs and Blazor forms use the async path in .NET 11; MVC controllers are not listed in the RC1 notes and the public design notes defer them to follow-up work, so treat MVC as a synchronous caller until the docs say otherwise.
+On purpose, and rightly so. But it makes adding an async attribute a breaking change for every caller that still validates synchronously, so find those callers before you decorate a shared model. Minimal APIs and Blazor forms use the async path in .NET 11; MVC controllers are not listed in the RC1 notes and the public design notes defer them to follow-up work, so treat MVC as a synchronous caller until the docs say otherwise.
 
 Validation decides whether a request gets in. The next two features are about seeing what the application does once it is in, starting with the cache that every request touches.
 
@@ -263,7 +264,7 @@ Validation decides whether a request gets in. The next two features are about se
 
 Do you need an extra package or an adapter for this? No. In .NET 11, `MemoryCache` publishes a meter named `Microsoft.Extensions.Caching.Memory.MemoryCache` as soon as you opt in with `TrackStatistics = true`. The new `MemoryCacheOptions.Name` becomes a `dotnet.cache.name` tag so that multiple caches can share a process, and a new constructor overload accepts an `IMeterFactory` for per-instance meters. `MemoryCacheStatistics` gained `TotalEvictions` to back the new eviction counter.
 
-This is what RC1 publishes, captured with a `MeterListener` in the test suite:
+RC1 publishes these four instruments, captured with a `MeterListener` in the test suite:
 
 | Instrument | Type | Unit | Tags |
 |---|---|---|---|
@@ -274,7 +275,7 @@ This is what RC1 publishes, captured with a `MeterListener` in the test suite:
 
 ### Example: a read-through product catalog
 
-In most applications the opt-in is a one-liner: `services.AddMemoryCache(options => options.TrackStatistics = true)`. The sample registers `AddMemoryCache()` and then configures it through an `IConfigureOptions<MemoryCacheOptions>` so that the demo-specific settings live next to the feature:
+In most applications the opt-in is a one-liner: `services.AddMemoryCache(options => options.TrackStatistics = true)`. In the demo the cache is configured through an `IConfigureOptions<MemoryCacheOptions>` instead, so that the demo-specific settings live next to the feature:
 
 ```csharp
 public void Configure(MemoryCacheOptions options)
@@ -327,13 +328,13 @@ Metric Name: dotnet.cache.estimated_size, Description: Estimated size of the cac
 
 Four misses (one per SKU), four hits, and one eviction because the size limit is three. The hit ratio is `hit / (hit + miss)`, which you can compute in any backend that supports the tag.
 
-A detail that cost us a few minutes: with the default `CompactionPercentage` of 5 %, a three-entry cache never evicts anything; it just refuses the fourth entry. The sample uses 50 % so the counter moves; real caches are large enough that the default is fine.
+A detail that cost me a few minutes (and a brief, unfair suspicion of the runtime): with the default `CompactionPercentage` of 5 %, a three-entry cache never evicts anything; it just refuses the fourth entry. The demo uses 50 % so the counter moves; real caches are large enough that the default is fine.
 
 ### Caveats
 
 - **The tag name is changing.** RC1 emits `dotnet.cache.request.type` and unit `By`; the `release/11.0` branch already has `dotnet.cache.request.result` and unit `1`, because `SizeLimit` is an application-defined number, not bytes. Re-check any dashboard or alert that references the tag at GA.
 - **`TrackStatistics` is not free.** It adds interlocked increments on every hit and miss. That is cheap, but measure it on a hot cache before enabling it everywhere.
-- **All four instruments are observable.** The hot path only increments the counters it already kept for `GetCurrentStatistics()`; values are read when a collector asks. If you read metrics with `MeterListener`, call `RecordObservableInstruments()`. The same release moved the HTTP `open_connections` and `active_requests` metrics to observable instruments, so this applies to more than the cache.
+- **All four instruments are observable.** The hot path only increments the counters it already kept for `GetCurrentStatistics()`; values are read when a collector asks. `MeterListener` users therefore have to call `RecordObservableInstruments()`. The same release moved the HTTP `open_connections` and `active_requests` metrics to observable instruments, so this applies to more than the cache.
 
 Metrics tell you how often the cache is hit. They do not tell you what a single slow order did along the way. For that you need traces, and the last feature is about deciding which traces you actually want, without a redeploy.
 
@@ -383,7 +384,7 @@ The configuration shape mirrors logging. This is the sample's `appsettings.json`
 
 ### Example: a console listener driven by configuration
 
-The sample registers one named listener with `AddListener` and binds the rules with `AddConfiguration`, as in the snippet above but without the code-based rules. The listener itself:
+In the demo there is one named listener, registered with `AddListener`, and the rules come from `AddConfiguration` alone, no code-based rules. The listener itself:
 
 ```csharp
 internal static class ConsoleActivityListener
@@ -434,25 +435,25 @@ Now change `"HealthCheck": false` to `true` in `appsettings.json` while the app 
 
 Set it back to `false` and the lines stop. No restart, no redeploy.
 
-### What we learned by running it
+### What I learned by running it
 
 The documentation for this feature is currently one paragraph and a five-line snippet, so most of the following comes from the source and from tests:
 
 - **Nothing is enabled by default.** `AddTracing()` without rules enables no source.
-- **You must set `Sample`.** A listener without a sampling callback never records anything, and `StartActivity` returns `null` for its sources. The snippet in the release notes omits this, which is why our first attempt produced no output.
+- **You must set `Sample`.** A listener without a sampling callback never records anything, and `StartActivity` returns `null` for its sources. The snippet in the release notes omits this, which is why my first attempt produced no output at all.
 - **Listeners activate when the host starts.** Rules are wired up during `IHost.StartAsync` (or when `ActivitySourceFactory` is first resolved). Building the service provider is not enough, which matters for tests and for tools that never start a host.
 - **Rules cover sources created with `new ActivitySource(...)` too.** Those are "global" scope; factory-created sources are "local". A rule for `Legacy.*` picks up activities from a plain `new ActivitySource("Legacy.Billing")`.
-- **The most specific rule wins.** A listener name beats none, a longer source pattern beats a shorter one, an operation name beats none. Between equally specific rules the last one registered wins; avoid overlapping rules rather than relying on that.
+- **Rules resolve like CSS selectors.** The most specific one wins: a listener name beats none, a longer source pattern beats a shorter one, an operation name beats none. Between equally specific rules the last one registered wins; avoid overlapping rules rather than relying on that.
 
 ### Rules and OpenTelemetry
 
-This is the question everyone will ask: does `AddTracing` replace OpenTelemetry's `AddSource`? No. OpenTelemetry registers its own `ActivityListener`, and the rules only govern listeners registered through `AddTracing`. We confirmed this with an OpenTelemetry `TracerProvider` and a rule that disables `HealthCheck`: OpenTelemetry still received `HealthCheck`, and the rule-driven listener did not.
+The question everyone asks first: does `AddTracing` replace OpenTelemetry's `AddSource`? No. OpenTelemetry registers its own `ActivityListener`, and the rules only govern listeners registered through `AddTracing`. I confirmed this with an OpenTelemetry `TracerProvider` and a rule that disables `HealthCheck`: OpenTelemetry still received `HealthCheck`, and the rule-driven listener did not.
 
-There is one interaction worth knowing about. ASP.NET Core's hosting layer creates a request activity even when no listener samples it, so that parent is unrecorded, and OpenTelemetry's default `ParentBased(AlwaysOn)` sampler follows the parent and drops the child spans. Sampling decisions are combined across listeners with the most permissive winning, so in our first run the rule-driven listener's `AllDataAndRecorded` decision is what got `PlaceOrder` exported, while `HealthCheck` looked as if the rule had suppressed it in OpenTelemetry too. The sample uses `SetSampler(new AlwaysOnSampler())` to keep the two mechanisms independent; in production, ASP.NET Core instrumentation samples the parent properly.
+There is one interaction worth knowing about. ASP.NET Core's hosting layer creates a request activity even when no listener samples it, so that parent is unrecorded, and OpenTelemetry's default `ParentBased(AlwaysOn)` sampler follows the parent and drops the child spans. Sampling decisions are combined across listeners with the most permissive winning, so in my first run the rule-driven listener's `AllDataAndRecorded` decision is what got `PlaceOrder` exported, while `HealthCheck` looked as if the rule had suppressed it in OpenTelemetry too. It had not; the sampler had. The demo uses `SetSampler(new AlwaysOnSampler())` to keep the two mechanisms independent; in production, ASP.NET Core instrumentation samples the parent properly.
 
 So where does this API fit? Use it for listeners you own: a console or file listener for local debugging, an in-process collector, a diagnostic listener you want operators to toggle in a running service. Keep your OpenTelemetry pipeline as it is.
 
-That is the last of the four features. Here is how to run the application and the tests behind them yourself.
+Four features down. Here is how to run the application and the tests behind them yourself.
 
 ## Running the sample
 
@@ -463,7 +464,7 @@ dotnet test
 dotnet run --project src/OrdersDemo   # listens on http://localhost:5028 (from launchSettings.json)
 ```
 
-The test project uses xUnit v3 on Microsoft.Testing.Platform, and the run we used for this article looked like this:
+The test project uses xUnit v3 on Microsoft.Testing.Platform, and the run I used for this article looked like this:
 
 ```
 OrdersDemo.Tests.dll (net11.0|x64) passed [+28/x0/?0] (1s 461ms)
@@ -496,7 +497,7 @@ Every observed behaviour listed in the feature sections above is backed by a tes
 
 ## Closing thoughts
 
-None of these four features will headline the .NET 11 launch keynote, and that is exactly why they are worth knowing: they are the changes you will use on a Tuesday afternoon, not the ones you will benchmark. Good luck with the upgrade, keep the tests from this article close, and treat every "it obviously works like this" moment with a little suspicion until GA. If you hit a surprise we did not cover, the sample repository is the place to open an issue.
+None of these four features will headline the .NET 11 launch keynote, and that is exactly why they are worth knowing: they are the changes you will use on a Tuesday afternoon, not the ones you will benchmark. Good luck with the upgrade, keep the tests from this article close, and treat every "it obviously works like this" moment with a little suspicion until GA. Hit a surprise I did not cover? The sample repository is the place to open an issue.
 
 ## References
 
